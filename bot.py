@@ -91,17 +91,31 @@ async def on_ready():
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
     config = load_config()
-    config[str(interaction.guild_id)] = str(interaction.channel_id)
+    guild_key = str(interaction.guild_id)
+
+    # 既存のボタンメッセージを削除
+    old_message_id = config.get(f"{guild_key}_button_message_id")
+    if old_message_id:
+        try:
+            old_message = await interaction.channel.fetch_message(int(old_message_id))
+            await old_message.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    config[guild_key] = str(interaction.channel_id)
     save_config(config)
 
     await interaction.response.send_message(
         f"✅ <#{interaction.channel_id}> に匿名投稿ボタンを設置しました！",
         ephemeral=True,
     )
-    await interaction.channel.send(
+    button_message = await interaction.channel.send(
         "このチャンネルで匿名メッセージを送ることができます。",
         view=AnonButtonView(),
     )
+
+    config[f"{guild_key}_button_message_id"] = str(button_message.id)
+    save_config(config)
 
 
 @setup.error
