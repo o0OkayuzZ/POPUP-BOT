@@ -102,12 +102,25 @@ class AnonModal(Modal, title="匿名メッセージを送信"):
             if guild_config.get("last_user_id") not in (None, user_id):
                 webhook_slot = 1 - webhook_slot
 
-            webhooks = await get_anon_webhooks(channel)
-            await webhooks[webhook_slot].send(
-                content=self.message.value,
-                username="匿名",
-                avatar_url="https://cdn.discordapp.com/embed/avatars/0.png",
-            )
+            try:
+                webhooks = await get_anon_webhooks(channel)
+                await webhooks[webhook_slot].send(
+                    content=self.message.value,
+                    username="匿名",
+                    avatar_url="https://cdn.discordapp.com/embed/avatars/0.png",
+                )
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "❌ 匿名投稿できませんでした。管理者がBOTに「Webhookを管理」の権限を付けてください。",
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException:
+                await interaction.followup.send(
+                    "❌ Discordへの投稿に失敗しました。少し待ってからもう一度送信してください。",
+                    ephemeral=True,
+                )
+                return
 
             guild_config["last_user_id"] = user_id
             guild_config["webhook_slot"] = webhook_slot
@@ -168,6 +181,14 @@ async def setup(interaction: discord.Interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
+    bot_member = channel.guild.me
+    if bot_member is None or not channel.permissions_for(bot_member).manage_webhooks:
+        await interaction.followup.send(
+            "❌ BOTに「Webhookを管理」の権限を付けてから、もう一度 `/setup` を実行してください。",
+            ephemeral=True,
+        )
+        return
+
     config = load_config()
     guild_config = get_guild_config(config, interaction.guild_id) or {}
     guild_config["channel_id"] = str(interaction.channel_id)
