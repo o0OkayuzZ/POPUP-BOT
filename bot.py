@@ -3,11 +3,15 @@ from discord import app_commands
 from discord.ui import Modal, TextInput, View, Button
 import json
 import os
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 CONFIG_FILE = "config.json"
+ANON_WEBHOOK_NAMES = ("AnonymousBot-1", "AnonymousBot-2")
+BUTTON_MESSAGE = "このチャンネルで匿名メッセージを送ることができます。"
+channel_locks: dict[int, asyncio.Lock] = {}
 
 
 def load_config() -> dict:
@@ -22,7 +26,43 @@ def save_config(config: dict):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
+def get_guild_config(config: dict, guild_id: int) -> dict | None:
+    guild_config = config.get(str(guild_id))
+    if isinstance(guild_config, str):
+        guild_config = {"channel_id": guild_config}
+        config[str(guild_id)] = guild_config
+    return guild_config
+
+
+async def move_button_to_bottom(channel: discord.TextChannel, guild_config: dict):
+    old_message_id = guild_config.get("button_message_id")
+    if old_message_id is not None:
+        try:
+            old_message = await channel.fetch_message(int(old_message_id))
+            await old_message.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    button_message = await channel.send(BUTTON_MESSAGE, view=AnonButtonView())
+    guild_config["button_message_id"] = str(button_message.id)
+
+
+async def get_anon_webhooks(channel: discord.TextChannel):
+    webhooks = await channel.webhooks()
+    result = []
+    for name in ANON_WEBHOOK_NAMES:
+        webhook = next((item for item in webhooks if item.name == name), None)
+        if webhook is None:
+            webhook = await channel.create_webhook(name=name)
+        result.append(webhook)
+    return result
+
+
 class AnonModal(Modal, title="匿名メッセージを送信"):
+    def __init__(self, button_message_id: int | None = None):
+        super().__init__()
+        self.button_message_id = button_message_id
+
     message = TextInput(
         label="メッセージ内容",
         placeholder="ここに入力...",
@@ -33,20 +73,48 @@ class AnonModal(Modal, title="匿名メッセージを送信"):
 
     async def on_submit(self, interaction: discord.Interaction):
         channel = interaction.channel
-        # Webhookを取得または作成
-        webhooks = await channel.webhooks()
-        webhook = next((w for w in webhooks if w.name == "AnonymousBot"), None)
-        if webhook is None:
-            webhook = await channel.create_webhook(name="AnonymousBot")
+        if not isinstance(channel, discord.TextChannel) or interaction.guild_id is None:
+            await interaction.response.send_message(
+                "❌ この場所では匿名投稿できません。", ephemeral=True
+            )
+            return
 
-        await webhook.send(
-            content=self.message.value,
-            username="匿名",
-            avatar_url="https://cdn.discordapp.com/embed/avatars/0.png",
-        )
-        await interaction.response.send_message(
-            "✅ 匿名で送信しました！", ephemeral=True
-        )
+        await interaction.response.defer(ephemeral=True)
+        lock = channel_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            config = load_config()
+            guild_config = get_guild_config(config, interaction.guild_id)
+            if guild_config is None or str(channel.id) != guild_config.get("channel_id"):
+                await interaction.followup.send(
+                    "❌ このチャンネルでは匿名投稿できません。", ephemeral=True
+                )
+                return
+
+            current_button_id = guild_config.get("button_message_id")
+            if self.button_message_id is not None and current_button_id in (
+                None,
+                str(self.button_message_id),
+            ):
+                guild_config["button_message_id"] = str(self.button_message_id)
+
+            webhook_slot = int(guild_config.get("webhook_slot", 0))
+            user_id = str(interaction.user.id)
+            if guild_config.get("last_user_id") not in (None, user_id):
+                webhook_slot = 1 - webhook_slot
+
+            webhooks = await get_anon_webhooks(channel)
+            await webhooks[webhook_slot].send(
+                content=self.message.value,
+                username="匿名",
+                avatar_url="https://cdn.discordapp.com/embed/avatars/0.png",
+            )
+
+            guild_config["last_user_id"] = user_id
+            guild_config["webhook_slot"] = webhook_slot
+            await move_button_to_bottom(channel, guild_config)
+            save_config(config)
+
+        await interaction.followup.send("✅ 匿名で送信しました！", ephemeral=True)
 
 
 class AnonButtonView(View):
@@ -60,13 +128,15 @@ class AnonButtonView(View):
     )
     async def send_anon(self, interaction: discord.Interaction, button: Button):
         config = load_config()
-        channel_id = config.get(str(interaction.guild_id))
+        guild_config = get_guild_config(config, interaction.guild_id)
+        channel_id = guild_config.get("channel_id") if guild_config else None
         if channel_id is None or str(interaction.channel_id) != channel_id:
             await interaction.response.send_message(
                 "❌ このボタンは匿名投稿チャンネルでのみ使用できます。", ephemeral=True
             )
             return
-        await interaction.response.send_modal(AnonModal())
+        button_message_id = interaction.message.id if interaction.message else None
+        await interaction.response.send_modal(AnonModal(button_message_id))
 
 
 class MyClient(discord.Client):
@@ -91,17 +161,16 @@ async def on_ready():
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
     config = load_config()
-    config[str(interaction.guild_id)] = str(interaction.channel_id)
-    save_config(config)
+    guild_config = get_guild_config(config, interaction.guild_id) or {}
+    guild_config["channel_id"] = str(interaction.channel_id)
+    config[str(interaction.guild_id)] = guild_config
 
     await interaction.response.send_message(
         f"✅ <#{interaction.channel_id}> に匿名投稿ボタンを設置しました！",
         ephemeral=True,
     )
-    await interaction.channel.send(
-        "このチャンネルで匿名メッセージを送ることができます。",
-        view=AnonButtonView(),
-    )
+    await move_button_to_bottom(interaction.channel, guild_config)
+    save_config(config)
 
 
 @setup.error
