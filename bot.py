@@ -36,15 +36,15 @@ def get_guild_config(config: dict, guild_id: int) -> dict | None:
 
 async def move_button_to_bottom(channel: discord.TextChannel, guild_config: dict):
     old_message_id = guild_config.get("button_message_id")
+    button_message = await channel.send(BUTTON_MESSAGE, view=AnonButtonView())
+    guild_config["button_message_id"] = str(button_message.id)
+
     if old_message_id is not None:
         try:
             old_message = await channel.fetch_message(int(old_message_id))
             await old_message.delete()
-        except (discord.NotFound, discord.Forbidden):
+        except discord.HTTPException:
             pass
-
-    button_message = await channel.send(BUTTON_MESSAGE, view=AnonButtonView())
-    guild_config["button_message_id"] = str(button_message.id)
 
 
 async def get_anon_webhooks(channel: discord.TextChannel):
@@ -160,17 +160,39 @@ async def on_ready():
 @client.tree.command(name="setup", description="このチャンネルに匿名投稿ボタンを設置します（管理者専用）")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel) or interaction.guild_id is None:
+        await interaction.response.send_message(
+            "❌ サーバーのテキストチャンネルで実行してください。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
     config = load_config()
     guild_config = get_guild_config(config, interaction.guild_id) or {}
     guild_config["channel_id"] = str(interaction.channel_id)
     config[str(interaction.guild_id)] = guild_config
 
-    await interaction.response.send_message(
+    try:
+        await move_button_to_bottom(channel, guild_config)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ ボタンを設置できませんでした。BOTに「チャンネルを見る」と「メッセージを送信」の権限を付けてください。",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "❌ Discordへの送信に失敗しました。少し待ってからもう一度 `/setup` を実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    save_config(config)
+    await interaction.followup.send(
         f"✅ <#{interaction.channel_id}> に匿名投稿ボタンを設置しました！",
         ephemeral=True,
     )
-    await move_button_to_bottom(interaction.channel, guild_config)
-    save_config(config)
 
 
 @setup.error
